@@ -45,10 +45,45 @@ def sigmoid(x):
 
 # define transformation
 def transformation(x):
-  return sigmoid(sigmoid(sigmoid(x))) 
+  return sigmoid(sigmoid(sigmoid(x)))
+
+# try another transformation:
+def transformation2(x):
+  return np.power(x, 3)
+
+# log_sum_exp for numerical stability
+def log_sum_exp(x, dim=0):
+    """
+    Compute the log(sum(exp(x), dim)) in a numerically stable manner
+
+    Args:
+        x: tensor: (...): Arbitrary tensor
+        dim: int: (): Dimension along which sum is computed
+
+    Return:
+        _: tensor: (...): log(sum(exp(x), dim))
+    """
+    max_x = np.amax(x, dim)
+    new_x = x - np.broadcast_to(np.expand_dims(max_x, dim), x.shape)
+    return max_x + np.log(np.sum(np.exp(new_x), dim))
+
+# use log_mean_exp function to assure numerical stability
+def log_mean_exp(x, dim):
+  """
+    Compute the log(mean(exp(x), dim)) in a numerically stable manner
+
+    Args:
+        x: tensor: (...): Arbitrary tensor
+        dim: int: (): Dimension along which mean is computed
+
+    Return:
+        _: tensor: (...): log(mean(exp(x), dim))
+    """
+  return log_sum_exp(x, dim) - np.log(x.shape[dim])
 
 # define new disentanglement evaluation metric
-def mi(factor_string, s_dim, enc, gen, dset, sample_size=10000, k_fold=5, random_state=np.random.RandomState(0)):
+def mi(factor_string, s_dim, enc, gen, dset, transform=None, 
+       sample_size=10000, k_fold=5, random_state=np.random.RandomState(0)):
 
   @tf.function
   def gen_eval(z):
@@ -59,64 +94,72 @@ def mi(factor_string, s_dim, enc, gen, dset, sample_size=10000, k_fold=5, random
   def enc_eval(x):
     enc.eval()
     return enc(x).mean()
-  enc_np = lambda x: enc_eval(transformation(x)).numpy()
+
+  # which transformation to apply
+  if transform == "t1":
+    enc_np = lambda x: transformation(enc_eval(x).numpy())
+  elif transform == "t2":
+    enc_np = lambda x: transformation2(enc_eval(x).numpy())
+  else:
+    enc_np = lambda x: enc_eval(x).numpy()
 
   # evaluate leave-one-out MI bound
   mean = 0
-  for i in range(sample_size):
-    # create samples
-    if "s=" in factor_string or "c=" in factor_string:
-      masks = datasets.make_masks(factor_string, s_dim, mask_type="match")
+  if "s=" in factor_string or "c=" in factor_string:
+    masks = datasets.make_masks(factor_string, s_dim, mask_type="match")
+    for i in range(sample_size):
+      # create samples
       sample, _ = datasets.sample_match_factors(dset, k_fold, masks, random_state)
 
-    xs = gen_eval(sample.astype('float32'))
-    zs = enc_np(xs)
+      xs = gen_eval(sample.astype('float32'))
+      zs = enc_np(xs)
 
-    # get right shapes so we can use LeaveOneOut
-    xshape = xs.shape
-    xs = np.reshape(xs, (xshape[0], -1))
+      # get right shapes so we can use LeaveOneOut
+      xshape = xs.shape
+      xs = np.reshape(xs, (xshape[0], -1))
 
-    # create leave-one-out iterator 
-    loo = LeaveOneOut()
-    loo.get_n_splits(xs)
+      # create leave-one-out iterator 
+      loo = LeaveOneOut()
+      loo.get_n_splits(xs)
 
-    # initialize the leave-one-out mean
-    inner_mean = 0
-    for train_index, test_index in loo.split(xs):
-      # split set
-      numerator = xs[test_index]
-      denominator = xs[train_index]
+      # initialize the leave-one-out mean
+      inner_mean = 0
+      for train_index, test_index in loo.split(xs):
+        # split set
+        numerator = xs[test_index]
+        denominator = xs[train_index]
 
-      zs_num = zs[test_index]
-      zs_denom = zs[train_index]
+        zs_num = zs[test_index]
+        zs_denom = zs[train_index]
 
-      # reshape
-      numerator = np.reshape(numerator, (-1, xshape[1], xshape[2], xshape[3]))
-      denominator = np.reshape(denominator, (-1, xshape[1], xshape[2], xshape[3]))
+        # reshape
+        numerator = np.reshape(numerator, (-1, xshape[1], xshape[2], xshape[3]))
+        denominator = np.reshape(denominator, (-1, xshape[1], xshape[2], xshape[3]))
 
-      # find likelihoods
-      numerator = enc.forward(numerator).prob(zs_num).numpy()
-      denominator = np.mean(enc.forward(denominator).prob(zs_denom).numpy())
+        # find likelihoods
+        numerator = enc.forward(numerator).log_prob(zs_num).numpy()
+        denominator = log_mean_exp(enc.forward(denominator).log_prob(zs_denom).numpy(), 0)
 
-      # print(numerator)
-      # print(denominator)
+        # print(numerator)
+        # print(denominator)
       
-      # calculate the leave one out sum
-      inner_mean += np.log(numerator) - np.log(denominator)
-    # create the leave one out mean
-    inner_mean = inner_mean/k_fold
-    mean += inner_mean
+        # calculate the leave one out sum
+        inner_mean += numerator - denominator
+        # create the leave one out mean
+        inner_mean = inner_mean/k_fold
+      mean += inner_mean
   mean = mean/sample_size
   # ut.log("MI: {}".format(mean))
   return {factor_string: mean}
 
-def evaluate_enc_mi(enc, gen, dset, s_dim, mi_sample_size=10000):
+def evaluate_enc_mi(enc, gen, dset, s_dim, transform=None, mi_sample_size=10000):
   itypes = ["{}={}".format(t, i)
             for t, i in itertools.product(("s", "c", "r"), range(s_dim))]
 
   evals = {}
   for it in itypes:
     scores = mi(it, s_dim, enc, gen, dset,
+                transform=transform,
                 sample_size=mi_sample_size,
                 random_state=np.random.RandomState(0))
     evals.update(scores)
@@ -400,19 +443,37 @@ def train(dset_name, s_dim, n_dim, factors,
   ###########################################################################
 
   # define transformed encoder eval
-  enc_tr = lambda x: enc_eval(transformation(x)).numpy()
+  enc_np = lambda x: enc_eval(x).numpy()
+  enc_tr = lambda x: transformation(enc_eval(x).numpy())
 
   ut.log("Consistency/Restrictiveness vs Mutual Information")
-  
-  # ut.log("Consistency/Restrictiveness")
-  # evaluate.evaluate_enc(enc_tr, dset, s_dim,
-  #                             FLAGS.gin_file,
-  #                             FLAGS.gin_bindings,
-  #                             pida_sample_size=10000,
-  #                             dlib_metrics=False)
+
+  ut.log("Consistency/Restrictiveness")
+
+  ut.log("Untransformed Consistency/Restrictiveness")
+  evaluate.evaluate_enc(enc_np, dset, s_dim,
+                        FLAGS.gin_file,
+                        FLAGS.gin_bindings,
+                        pida_sample_size=10000,
+                        dlib_metrics=False)
+
+  ut.log("Transformed Consistency/Restrictiveness")
+  evaluate.evaluate_enc(enc_tr, dset, s_dim,
+                                FLAGS.gin_file,
+                                FLAGS.gin_bindings,
+                                pida_sample_size=10000,
+                                dlib_metrics=False)
 
   ut.log("Mutual Information")
-  evaluate_enc_mi(enc, gen, dset, s_dim, mi_sample_size=1)
+
+  ut.log("Untransformed MI")
+  evaluate_enc_mi(enc, gen, dset, s_dim, transform=None, mi_sample_size=100)
+
+  # apply transformation to the mean head of the encoder, and retrain the 
+  # variance head of the encoder
+
+  ut.log("Transformed MI")
+  evaluate_enc_mi(enc, gen, dset, s_dim, transform="t1", mi_sample_size=100)
 
   ###########################################################################
   # End change
