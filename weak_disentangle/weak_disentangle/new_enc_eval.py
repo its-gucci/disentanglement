@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import tensorflow as tf
+import tensorflow_probability as tfp
 import time
 import itertools
 from absl import app
@@ -34,6 +35,7 @@ from weak_disentangle import datasets, viz, networks, evaluate
 from weak_disentangle import utils as ut
 tf.enable_v2_behavior()
 tfk = tf.keras
+tfd = tfp.distributions
 
 ###########################################################################
 # Helper functions for MI, transformations
@@ -103,8 +105,13 @@ def mi(factor_string, s_dim, enc, gen, dset, transform=None,
   else:
     enc_np = lambda x: enc_eval(x).numpy()
 
-  # evaluate leave-one-out MI bound
+  # hack to prevent errors
+  if "r=" in factor_string:
+    return {factor_string: 0, factor_string + 'norm': 0}
+
+  # evaluate leave-one-out MI bound and entropy
   mean = 0
+  entropy = 0
   if "s=" in factor_string or "c=" in factor_string:
     masks = datasets.make_masks(factor_string, s_dim, mask_type="match")
     for i in range(sample_size):
@@ -113,6 +120,14 @@ def mi(factor_string, s_dim, enc, gen, dset, transform=None,
 
       xs = gen_eval(sample.astype('float32'))
       zs = enc_np(xs)
+
+      # calculate entropy
+      masked_zs = zs[:, masks.reshape(-1)==0]
+      masked_dist = tfd.MultivariateNormalDiag(
+        loc=enc.forward(xs).mean().numpy()[:, masks.reshape(-1)==0],
+        scale_diag=enc.forward(xs).stddev().numpy()[:, masks.reshape(-1)==0]
+      )    
+      entropy += np.mean(masked_dist.log_prob(masked_zs).numpy())
 
       # get right shapes so we can use LeaveOneOut
       xshape = xs.shape
@@ -136,21 +151,39 @@ def mi(factor_string, s_dim, enc, gen, dset, transform=None,
         numerator = np.reshape(numerator, (-1, xshape[1], xshape[2], xshape[3]))
         denominator = np.reshape(denominator, (-1, xshape[1], xshape[2], xshape[3]))
 
-        # find likelihoods
-        numerator = enc.forward(numerator).log_prob(zs_num).numpy()
-        denominator = log_mean_exp(enc.forward(denominator).log_prob(zs_denom).numpy(), 0)
+        # mask out everything but I?
+        zs_num = zs_num[:, masks.reshape(-1)==0]
+        zs_denom = zs_denom[:, masks.reshape(-1)==0]
+        masked_num_dist = tfd.MultivariateNormalDiag(
+          loc=enc.forward(numerator).mean().numpy()[:, masks.reshape(-1)==0],
+          scale_diag=enc.forward(numerator).stddev().numpy()[:, masks.reshape(-1)==0]
+        )
+        masked_denom_dist = tfd.MultivariateNormalDiag(
+          loc=enc.forward(denominator).mean().numpy()[:, masks.reshape(-1)==0],
+          scale_diag=enc.forward(denominator).stddev().numpy()[:, masks.reshape(-1)==0]
+        )
 
-        # print(numerator)
-        # print(denominator)
+        # find likelihoods
+        numerator = masked_num_dist.log_prob(zs_num).numpy()[0]
+        denominator = log_mean_exp(masked_denom_dist.log_prob(zs_denom).numpy(), 0)
+
+        # numerator = enc.forward(numerator).log_prob(zs_num).numpy()[0]
+        # denominator = log_mean_exp(enc.forward(denominator).log_prob(zs_denom).numpy(), 0)
       
         # calculate the leave one out sum
         inner_mean += numerator - denominator
+
         # create the leave one out mean
-        inner_mean = inner_mean/k_fold
+        inner_mean = inner_mean/(2 * k_fold)
       mean += inner_mean
   mean = mean/sample_size
+  entropy = -entropy/sample_size
+
+  # normalized MI
+  norm_mi = 1 - mean/entropy
+
   # ut.log("MI: {}".format(mean))
-  return {factor_string: mean}
+  return {factor_string: mean, factor_string + '_norm': norm_mi}
 
 def evaluate_enc_mi(enc, gen, dset, s_dim, transform=None, mi_sample_size=10000):
   itypes = ["{}={}".format(t, i)
@@ -470,7 +503,31 @@ def train(dset_name, s_dim, n_dim, factors,
   evaluate_enc_mi(enc, gen, dset, s_dim, transform=None, mi_sample_size=100)
 
   # apply transformation to the mean head of the encoder, and retrain the 
-  # variance head of the encoder
+  # variance head of the encoder with new layers
+  new_enc = networks.RetrainEncoder(x_shape ,s_dim, enc)
+  new_enc_opt = tfk.optimizers.Adam(learning_rate=enc_lr, beta_1=0.5, beta_2=0.999, epsilon=1e-8)
+  def train_new_enc_step():
+    new_enc.train()
+    # Alternate discriminator step and generator step
+    with tf.GradientTape(persistent=True) as tape:
+      # Generate
+      z1, z2, y_fake = datasets.paired_randn(batch_size, z_dim, masks)
+      x1_fake = tf.stop_gradient(gen(z1))
+
+      # Encode
+      p_z = new_enc(x1_fake)
+
+      # calculate loss
+      new_enc_loss = -tf.reduce_mean(p_z.log_prob(z1[:, :s_dim]))
+
+    new_enc_grads = tape.gradient(new_enc_loss, new_enc.trainable_variables)
+
+    new_enc_opt.apply_gradients(zip(new_enc_grads, new_enc.trainable_variables))
+
+    return dict(enc_loss=new_enc_loss)
+
+  for i in range(1):
+    train_new_enc_step()
 
   ut.log("Transformed MI")
   evaluate_enc_mi(enc, gen, dset, s_dim, transform="t1", mi_sample_size=100)
