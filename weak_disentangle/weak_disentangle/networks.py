@@ -63,6 +63,40 @@ class Encoder(ts.Module):
         scale_diag=tf.nn.softplus(b) + 1e-8)
 
 
+###########################################################################
+# Class that retrains encoder following the application of a 
+# transformation to the mean head of the original encoder
+###########################################################################
+@gin.configurable
+class RetrainEncoder(ts.Module):
+  def __init__(self, x_shape, z_dim, old_enc, width=1):
+    super().__init__()
+
+    self.old_enc = old_enc
+
+    self.net = ts.Sequential(
+      dense(128 * width), ts. LeakyReLU(),
+      dense(z_dim)
+    )
+
+    ut.log("Building new encoder...")
+    self.build([1] + x_shape)
+    self.apply(ut.reset_parameters)
+
+  def forward(self, x):
+    p_z = self.old_enc(x)
+    mean = p_z.mean()
+    diag = p_z.stddev()
+    x = tf.concat([mean, diag], -1)
+    b = self.net(x)
+    return tfd.MultivariateNormalDiag(
+      loc=mean,
+      scale_diag=tf.nn.softplus(b) + 1e-8)
+###########################################################################
+# End change
+###########################################################################
+
+
 @gin.configurable
 class LabelDiscriminator(ts.Module):
   def __init__(self, x_shape, y_dim, width=1, share_dense=False,
