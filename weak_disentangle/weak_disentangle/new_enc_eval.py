@@ -526,7 +526,7 @@ def train(dset_name, s_dim, n_dim, factors,
 
     return dict(enc_loss=new_enc_loss)
 
-  for i in range(1):
+  for i in range(100000):
     train_new_enc_step()
 
   ut.log("Transformed MI")
